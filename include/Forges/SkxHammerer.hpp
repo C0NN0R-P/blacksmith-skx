@@ -1,9 +1,22 @@
 #pragma once
 
 #include <cstddef>
+#include <string>
 #include <vector>
 
 #include "Memory/SKXDecoder.hpp"
+
+struct SKXPairCandidate {
+    SKXHit a;
+    SKXHit b;
+    long row_distance;
+};
+
+struct SKXPairResult {
+    SKXPairCandidate pair;
+    size_t hammer_iters;
+    size_t flip_count;
+};
 
 class SkxHammerer {
 public:
@@ -22,11 +35,19 @@ private:
     int choose_best_bank(const std::vector<SKXHit> &hits, int requested_bank);
     void print_bank_histogram(const std::vector<SKXHit> &hits);
 
-    bool pick_two_distinct_rows(const std::vector<SKXHit> &hits,
-                                size_t &left_idx,
-                                size_t &right_idx);
+    std::vector<SKXPairCandidate> build_candidate_pairs(const std::vector<SKXHit> &hits,
+                                                        size_t max_pairs);
+    void print_candidate_pairs(const std::vector<SKXPairCandidate> &pairs, size_t max_to_print);
 
     void hammer_pair(volatile char *a, volatile char *b, size_t iters);
+
+    size_t scan_flips(volatile char *buf,
+                      size_t bytes,
+                      const std::vector<unsigned char> &baseline,
+                      size_t max_report);
+
+    bool write_csv_report(const std::string &path,
+                          const std::vector<SKXPairResult> &results);
 
 private:
     SKXDecoder decoder_;

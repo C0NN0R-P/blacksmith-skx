@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <sys/mman.h>
 #include <unordered_map>
 #include <vector>
@@ -141,31 +142,83 @@ int SkxHammerer::choose_best_bank(const std::vector<SKXHit> &hits, int requested
     return best_bank;
 }
 
-bool SkxHammerer::pick_two_distinct_rows(const std::vector<SKXHit> &hits,
-                                         size_t &left_idx,
-                                         size_t &right_idx) {
+std::vector<SKXPairCandidate> SkxHammerer::build_candidate_pairs(const std::vector<SKXHit> &hits,
+                                                                 size_t max_pairs) {
+    std::vector<SKXPairCandidate> out;
     if (hits.size() < 2) {
-        SKXHAMDBG("pick_two_distinct_rows: fewer than 2 hits");
-        return false;
+        SKXHAMDBG("build_candidate_pairs: not enough hits");
+        return out;
     }
 
+    /*
+     * Assumes caller already filtered to a single bank and a single dominant context.
+     * We now want row-distinct pairs, with preference for small row distance.
+     */
     for (size_t i = 0; i < hits.size(); i++) {
         for (size_t j = i + 1; j < hits.size(); j++) {
-            if (hits[i].row != hits[j].row) {
-                left_idx = i;
-                right_idx = j;
+            if (hits[i].row == hits[j].row) continue;
 
-                fprintf(stderr,
-                        "[SkxHammerer] pick_two_distinct_rows: chose row 0x%llx and row 0x%llx\n",
-                        (unsigned long long)hits[i].row,
-                        (unsigned long long)hits[j].row);
-                return true;
-            }
+            SKXPairCandidate cand{};
+            cand.a = hits[i];
+            cand.b = hits[j];
+            cand.row_distance = (long)hits[j].row - (long)hits[i].row;
+            if (cand.row_distance < 0) cand.row_distance = -cand.row_distance;
+
+            out.push_back(cand);
         }
     }
 
-    SKXHAMDBG("pick_two_distinct_rows: all hits are on the same row");
-    return false;
+    std::sort(out.begin(), out.end(), [](const SKXPairCandidate &x, const SKXPairCandidate &y) {
+        if (x.row_distance != y.row_distance) return x.row_distance < y.row_distance;
+        if (x.a.row != y.a.row) return x.a.row < y.a.row;
+        if (x.b.row != y.b.row) return x.b.row < y.b.row;
+        return x.a.va < y.a.va;
+    });
+
+    /*
+     * Keep only one pair per row-row combination to avoid too many duplicates
+     * across different columns of the same two rows.
+     */
+    std::vector<SKXPairCandidate> deduped;
+    deduped.reserve(out.size());
+
+    std::unordered_map<uint64_t, bool> seen;
+    for (const auto &cand : out) {
+        uint64_t r1 = cand.a.row;
+        uint64_t r2 = cand.b.row;
+        if (r1 > r2) std::swap(r1, r2);
+
+        uint64_t key = (r1 << 32) ^ r2;
+        if (seen.find(key) != seen.end()) continue;
+        seen[key] = true;
+
+        deduped.push_back(cand);
+        if (deduped.size() >= max_pairs) break;
+    }
+
+    SKXHAMDBG("build_candidate_pairs: raw=%zu deduped=%zu",
+              out.size(), deduped.size());
+    return deduped;
+}
+
+void SkxHammerer::print_candidate_pairs(const std::vector<SKXPairCandidate> &pairs, size_t max_to_print) {
+    fprintf(stderr, "\n[SkxHammerer] candidate pairs (showing up to %zu):\n", max_to_print);
+
+    const size_t n = std::min(max_to_print, pairs.size());
+    for (size_t i = 0; i < n; i++) {
+        const auto &p = pairs[i];
+        fprintf(stderr,
+                "  #%zu rowA=0x%llx rowB=0x%llx distance=%ld bank_id=%d "
+                "A_va=%p B_va=%p\n",
+                i,
+                (unsigned long long)p.a.row,
+                (unsigned long long)p.b.row,
+                p.row_distance,
+                p.a.bank_id,
+                (void *)p.a.va,
+                (void *)p.b.va);
+    }
+    fprintf(stderr, "\n");
 }
 
 void SkxHammerer::hammer_pair(volatile char *a, volatile char *b, size_t iters) {
@@ -180,7 +233,7 @@ void SkxHammerer::hammer_pair(volatile char *a, volatile char *b, size_t iters) 
         sink ^= *a;
         sink ^= *b;
 
-        if ((i % 100000) == 0) {
+        if ((i % 1000000) == 0) {
             fprintf(stderr,
                     "[SkxHammerer] hammer_pair progress: i=%zu / %zu\n",
                     i, iters);
@@ -192,6 +245,78 @@ void SkxHammerer::hammer_pair(volatile char *a, volatile char *b, size_t iters) 
     }
 
     SKXHAMDBG("hammer_pair: done");
+}
+
+size_t SkxHammerer::scan_flips(volatile char *buf,
+                               size_t bytes,
+                               const std::vector<unsigned char> &baseline,
+                               size_t max_report) {
+    size_t flip_count = 0;
+
+    for (size_t i = 0; i < bytes; i++) {
+        const unsigned char now = (unsigned char)buf[i];
+        const unsigned char was = baseline[i];
+
+        if (now != was) {
+            if (flip_count < max_report) {
+                fprintf(stderr,
+                        "[SkxHammerer] FLIP offset=0x%zx addr=%p before=0x%02x after=0x%02x\n",
+                        i, (void *)(buf + i), was, now);
+            }
+            flip_count++;
+        }
+    }
+
+    return flip_count;
+}
+
+bool SkxHammerer::write_csv_report(const std::string &path,
+                                   const std::vector<SKXPairResult> &results) {
+    FILE *fp = fopen(path.c_str(), "w");
+    if (!fp) {
+        perror("[SkxHammerer] fopen(csv report) failed");
+        return false;
+    }
+
+    fprintf(fp,
+            "pair_index,hammer_iters,flip_count,row_distance,"
+            "socket,imc,channel,dimm,rank,bank_group,bank,bank_id,"
+            "row_a,col_a,va_a,pa_a,row_b,col_b,va_b,pa_b\n");
+
+    for (size_t i = 0; i < results.size(); i++) {
+        const auto &r = results[i];
+        fprintf(fp,
+                "%zu,%zu,%zu,%ld,"
+                "%d,%d,%d,%d,%d,%d,%d,%d,"
+                "%llu,%llu,%p,0x%llx,%llu,%llu,%p,0x%llx\n",
+                i,
+                r.hammer_iters,
+                r.flip_count,
+                r.pair.row_distance,
+
+                r.pair.a.socket,
+                r.pair.a.imc,
+                r.pair.a.channel,
+                r.pair.a.dimm,
+                r.pair.a.rank,
+                r.pair.a.bank_group,
+                r.pair.a.bank,
+                r.pair.a.bank_id,
+
+                (unsigned long long)r.pair.a.row,
+                (unsigned long long)r.pair.a.col,
+                (void *)r.pair.a.va,
+                (unsigned long long)r.pair.a.pa,
+
+                (unsigned long long)r.pair.b.row,
+                (unsigned long long)r.pair.b.col,
+                (void *)r.pair.b.va,
+                (unsigned long long)r.pair.b.pa);
+    }
+
+    fclose(fp);
+    fprintf(stderr, "[SkxHammerer] wrote CSV report to %s\n", path.c_str());
+    return true;
 }
 
 bool SkxHammerer::run(size_t bytes,
@@ -220,22 +345,9 @@ bool SkxHammerer::run(size_t bytes,
 
     SKXHAMDBG("allocated buffer at %p", (void *)buf);
 
-    /*
-     * Fill with a fixed pattern so flips are easy to detect.
-     * 0xFF is common for Rowhammer experiments, since 1->0 flips are easy to spot.
-     */
     fill_pattern(buf, bytes, 0xFF);
     flush_buffer(buf, bytes);
     SKXHAMDBG("buffer filled with 0xFF pattern");
-
-    /*
-     * Save a baseline copy for post-hammer comparison.
-     */
-    std::vector<unsigned char> baseline(bytes);
-    for (size_t i = 0; i < bytes; i++) {
-        baseline[i] = (unsigned char)buf[i];
-    }
-    SKXHAMDBG("baseline snapshot captured");
 
     auto hits = decoder_.collect_hits(buf, bytes, step, max_hits);
     SKXHAMDBG("decoder returned %zu hits", hits.size());
@@ -263,7 +375,7 @@ bool SkxHammerer::run(size_t bytes,
     auto context_hits = filter_to_common_context(bank_hits);
 
     if (context_hits.size() < 2) {
-        SKXHAMDBG("not enough hits in chosen bank/context to hammer");
+        SKXHAMDBG("not enough hits in chosen bank/context to continue");
         munmap((void *)buf, bytes);
         return false;
     }
@@ -271,88 +383,123 @@ bool SkxHammerer::run(size_t bytes,
     std::sort(context_hits.begin(), context_hits.end(), [](const SKXHit &a, const SKXHit &b) {
         if (a.row != b.row) return a.row < b.row;
         if (a.col != b.col) return a.col < b.col;
-        if (a.imc != b.imc) return a.imc < b.imc;
-        if (a.channel != b.channel) return a.channel < b.channel;
         return a.va < b.va;
     });
 
-    SKXHAMDBG("sorted %zu context hits by row/col/imc/ch", context_hits.size());
+    SKXHAMDBG("sorted %zu context hits by row/col", context_hits.size());
 
-    size_t left = 0;
-    size_t right = 0;
-    if (!pick_two_distinct_rows(context_hits, left, right)) {
-        SKXHAMDBG("could not find two distinct rows in same bank/context");
+    const size_t max_pairs = 16;
+    auto pairs = build_candidate_pairs(context_hits, max_pairs);
+
+    if (pairs.empty()) {
+        SKXHAMDBG("no candidate pairs found");
         munmap((void *)buf, bytes);
         return false;
     }
 
-    fprintf(stderr,
-            "[SkxHammerer] chosen pair:\n"
-            "  A: socket=%d imc=%d ch=%d dimm=%d rank=%d bg=%d bank=%d bank_id=%d row=0x%llx col=0x%llx va=%p pa=0x%llx\n"
-            "  B: socket=%d imc=%d ch=%d dimm=%d rank=%d bg=%d bank=%d bank_id=%d row=0x%llx col=0x%llx va=%p pa=0x%llx\n",
-            context_hits[left].socket,
-            context_hits[left].imc,
-            context_hits[left].channel,
-            context_hits[left].dimm,
-            context_hits[left].rank,
-            context_hits[left].bank_group,
-            context_hits[left].bank,
-            context_hits[left].bank_id,
-            (unsigned long long)context_hits[left].row,
-            (unsigned long long)context_hits[left].col,
-            (void *)context_hits[left].va,
-            (unsigned long long)context_hits[left].pa,
+    print_candidate_pairs(pairs, 16);
 
-            context_hits[right].socket,
-            context_hits[right].imc,
-            context_hits[right].channel,
-            context_hits[right].dimm,
-            context_hits[right].rank,
-            context_hits[right].bank_group,
-            context_hits[right].bank,
-            context_hits[right].bank_id,
-            (unsigned long long)context_hits[right].row,
-            (unsigned long long)context_hits[right].col,
-            (void *)context_hits[right].va,
-            (unsigned long long)context_hits[right].pa);
+    std::vector<SKXPairResult> results;
+    results.reserve(pairs.size());
 
-    hammer_pair(context_hits[left].va, context_hits[right].va, hammer_iters);
+    size_t best_flip_count = 0;
+    long best_distance = std::numeric_limits<long>::max();
+    ssize_t best_index = -1;
 
-    /*
-     * Force data back from memory hierarchy before scan.
-     */
-    flush_buffer(buf, bytes);
-    SKXHAMDBG("post-hammer flush complete");
+    for (size_t idx = 0; idx < pairs.size(); idx++) {
+        const auto &pair = pairs[idx];
 
-    /*
-     * Compare post-hammer contents against baseline.
-     */
-    size_t flip_count = 0;
-    const size_t max_report = 64;
+        fprintf(stderr,
+                "\n[SkxHammerer] === TESTING PAIR %zu/%zu ===\n"
+                "  rowA=0x%llx rowB=0x%llx distance=%ld bank_id=%d\n",
+                idx + 1,
+                pairs.size(),
+                (unsigned long long)pair.a.row,
+                (unsigned long long)pair.b.row,
+                pair.row_distance,
+                pair.a.bank_id);
 
-    fprintf(stderr, "\n[SkxHammerer] scanning for flips...\n");
+        /*
+         * Reset memory before each trial.
+         */
+        fill_pattern(buf, bytes, 0xFF);
+        flush_buffer(buf, bytes);
 
-    for (size_t i = 0; i < bytes; i++) {
-        unsigned char now = (unsigned char)buf[i];
-        unsigned char was = baseline[i];
+        std::vector<unsigned char> baseline(bytes);
+        for (size_t i = 0; i < bytes; i++) {
+            baseline[i] = (unsigned char)buf[i];
+        }
 
-        if (now != was) {
-            if (flip_count < max_report) {
-                fprintf(stderr,
-                        "[SkxHammerer] FLIP offset=0x%zx addr=%p before=0x%02x after=0x%02x\n",
-                        i, (void *)(buf + i), was, now);
-            }
-            flip_count++;
+        fprintf(stderr,
+                "[SkxHammerer] pair %zu addresses:\n"
+                "  A: socket=%d imc=%d ch=%d dimm=%d rank=%d bg=%d bank=%d bank_id=%d row=0x%llx col=0x%llx va=%p pa=0x%llx\n"
+                "  B: socket=%d imc=%d ch=%d dimm=%d rank=%d bg=%d bank=%d bank_id=%d row=0x%llx col=0x%llx va=%p pa=0x%llx\n",
+                idx,
+                pair.a.socket, pair.a.imc, pair.a.channel, pair.a.dimm, pair.a.rank,
+                pair.a.bank_group, pair.a.bank, pair.a.bank_id,
+                (unsigned long long)pair.a.row,
+                (unsigned long long)pair.a.col,
+                (void *)pair.a.va,
+                (unsigned long long)pair.a.pa,
+
+                pair.b.socket, pair.b.imc, pair.b.channel, pair.b.dimm, pair.b.rank,
+                pair.b.bank_group, pair.b.bank, pair.b.bank_id,
+                (unsigned long long)pair.b.row,
+                (unsigned long long)pair.b.col,
+                (void *)pair.b.va,
+                (unsigned long long)pair.b.pa);
+
+        hammer_pair(pair.a.va, pair.b.va, hammer_iters);
+
+        flush_buffer(buf, bytes);
+        fprintf(stderr, "[SkxHammerer] post-hammer flush complete for pair %zu\n", idx);
+
+        fprintf(stderr, "[SkxHammerer] scanning for flips for pair %zu...\n", idx);
+        const size_t flip_count = scan_flips(buf, bytes, baseline, 16);
+
+        if (flip_count == 0) {
+            fprintf(stderr, "[SkxHammerer] pair %zu RESULT: no flips detected\n", idx);
+        } else {
+            fprintf(stderr, "[SkxHammerer] pair %zu RESULT: %zu flips detected\n", idx, flip_count);
+        }
+
+        SKXPairResult r{};
+        r.pair = pair;
+        r.hammer_iters = hammer_iters;
+        r.flip_count = flip_count;
+        results.push_back(r);
+
+        if (flip_count > best_flip_count ||
+            (flip_count == best_flip_count && pair.row_distance < best_distance)) {
+            best_flip_count = flip_count;
+            best_distance = pair.row_distance;
+            best_index = (ssize_t)idx;
         }
     }
 
-    if (flip_count == 0) {
-        fprintf(stderr, "[SkxHammerer] RESULT: no flips detected\n");
-    } else {
+    write_csv_report("skx_pair_report.csv", results);
+
+    fprintf(stderr, "\n[SkxHammerer] ===== FINAL SUMMARY =====\n");
+    fprintf(stderr, "[SkxHammerer] tested %zu candidate pairs\n", results.size());
+    fprintf(stderr, "[SkxHammerer] chosen bank for testing: %d\n", chosen_bank);
+
+    size_t num_pairs_with_flips = 0;
+    for (const auto &r : results) {
+        if (r.flip_count > 0) num_pairs_with_flips++;
+    }
+
+    fprintf(stderr, "[SkxHammerer] pairs with flips: %zu\n", num_pairs_with_flips);
+
+    if (best_index >= 0) {
+        const auto &best = results[(size_t)best_index];
         fprintf(stderr,
-                "[SkxHammerer] RESULT: %zu flips detected%s\n",
-                flip_count,
-                (flip_count > max_report ? " (first 64 shown)" : ""));
+                "[SkxHammerer] best pair index=%zd flip_count=%zu row_distance=%ld "
+                "rowA=0x%llx rowB=0x%llx\n",
+                best_index,
+                best.flip_count,
+                best.pair.row_distance,
+                (unsigned long long)best.pair.a.row,
+                (unsigned long long)best.pair.b.row);
     }
 
     munmap((void *)buf, bytes);
