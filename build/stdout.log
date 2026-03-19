@@ -1,0 +1,48 @@
+[0;35m[1m[+] BLACKSMITH_SKX_MODE enabled. Entering local SKX concrete mode.[0m
+[0;36m[+] Skipping stock Coffee Lake DRAM matrix path.[0m
+[0;36m[+] This mode is intended for your local experimental SKX integration.[0m
+[0;36m[+] SKX settings: bytes=268435456 step=64 max_hits=128 bank=0 iters=500000[0m
+[0;91m[-] SkxHammerer failed.[0m
+
+[0;35m[1m[+] BLACKSMITH_SKX_MODE enabled. Entering local SKX concrete mode.[0m
+[0;36m[+] Skipping stock Coffee Lake DRAM matrix path.[0m
+[0;36m[+] This mode is intended for your local experimental SKX integration.[0m
+[0;36m[+] SKX settings: bytes=268435456 step=64 max_hits=256 bank=0 iters=500000[0m
+[0;32m[!] SkxHammerer completed successfully.[0m
+
+[0;35m[1m[+] BLACKSMITH_SKX_MODE enabled. Entering local SKX concrete mode.[0m
+[0;36m[+] Skipping stock Coffee Lake DRAM matrix path.[0m
+[0;36m[+] This mode is intended for your local experimental SKX integration.[0m
+[0;36m[+] SKX settings: bytes=536870912 step=64 max_hits=2000 bank=9 iters=5000000[0m
+[0;32m[!] SkxHammerer completed successfully.[0m
+
+[0;35m[1m[+] BLACKSMITH_SKX_MODE enabled. Entering local SKX concrete mode.[0m
+[0;36m[+] Skipping stock Coffee Lake DRAM matrix path.[0m
+[0;36m[+] This mode is intended for your local experimental SKX integration.[0m
+[0;36m[+] SKX settings: bytes=536870912 step=64 max_hits=4000 bank=9 iters=5000000[0m
+[0;32m[!] SkxHammerer completed successfully.[0m
+
+[0;35m[1m[+] BLACKSMITH_SKX_MODE enabled. Entering local SKX concrete mode.[0m
+[0;36m[+] Skipping stock Coffee Lake DRAM matrix path.[0m
+[0;36m[+] This mode is intended for your local experimental SKX integration.[0m
+[0;36m[+] SKX settings: bytes=536870912 step=64 max_hits=4000 bank=9 iters=5000000[0m
+[0;32m[!] SkxHammerer completed successfully.[0m
+
+[0;35m[1m[+] BLACKSMITH_SKX_MODE enabled. Entering local SKX concrete mode.[0m
+[0;36m[+] Skipping stock Coffee Lake DRAM matrix path.[0m
+[0;36m[+] This mode is intended for your local experimental SKX integration.[0m
+[0;36m[+] SKX settings: bytes=268435456 step=64 max_hits=1000 bank=9 iters=200000[0m
+[0;91m[-] SkxHammerer failed.[0m
+
+[0;35m[1m[+] BLACKSMITH_SKX_MODE enabled. Entering local SKX concrete mode.[0m
+[0;36m[+] Skipping stock Coffee Lake DRAM matrix path.[0m
+[0;36m[+] This mode is intended for your local experimental SKX integration.[0m
+[0;36m[+] SKX settings: bytes=268435456 step=64 max_hits=1000 bank=9 iters=200000[0m
+[0;32m[!] SkxHammerer completed successfully.[0m
+
+[0;35m[1m[+] BLACKSMITH_SKX_MODE enabled. Entering local SKX concrete mode.[0m
+[0;36m[+] Skipping stock Coffee Lake DRAM matrix path.[0m
+[0;36m[+] This mode is intended for your local experimental SKX integration.[0m
+[0;36m[+] SKX settings: bytes=268435456 step=64 max_hits=1000 bank=3 iters=2000000[0m
+[0;32m[!] SkxHammerer completed successfully.[0m
+

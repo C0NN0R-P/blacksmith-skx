@@ -1,0 +1,2 @@
+pair_index,backend,hammer_iters,flip_count,row_distance,exact_double_sided,socket,imc,channel,dimm,rank,bank_group,bank,bank_id,row_a,col_a,va_a,pa_a,row_b,col_b,va_b,pa_b
+0,jit,2000000,0,11898,no,0,0,0,0,1,0,3,3,4370,0,0x7ef086e02000,0x208648000,16268,8,0x7ef086e07080,0x3fce88080
