@@ -6,6 +6,11 @@
 
 #include "Memory/SKXDecoder.hpp"
 
+enum class SKXHammerBackend {
+    SIMPLE,
+    JIT
+};
+
 struct SKXPairCandidate {
     SKXHit a;
     SKXHit b;
@@ -14,6 +19,7 @@ struct SKXPairCandidate {
 
 struct SKXPairResult {
     SKXPairCandidate pair;
+    std::string backend;
     size_t hammer_iters;
     size_t flip_count;
 };
@@ -39,7 +45,8 @@ private:
                                                         size_t max_pairs);
     void print_candidate_pairs(const std::vector<SKXPairCandidate> &pairs, size_t max_to_print);
 
-    void hammer_pair(volatile char *a, volatile char *b, size_t iters);
+    void hammer_pair_simple(volatile char *a, volatile char *b, size_t iters);
+    void hammer_pair_jit(volatile char *a, volatile char *b, size_t total_activations);
 
     size_t scan_flips(volatile char *buf,
                       size_t bytes,

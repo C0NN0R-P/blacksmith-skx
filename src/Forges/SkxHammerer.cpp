@@ -6,9 +6,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <sys/mman.h>
 #include <unordered_map>
 #include <vector>
+
+#include "Fuzzer/CodeJitter.hpp"
+#include "Utilities/Enums.hpp"
 
 #define SKXHAMDBG(fmt, ...) fprintf(stderr, "[SkxHammerer] " fmt "\n", ##__VA_ARGS__)
 
@@ -31,6 +35,60 @@ static void flush_buffer(volatile char *buf, size_t bytes) {
         clflush_one((const void *)(buf + i));
     }
     __asm__ __volatile__("mfence" ::: "memory");
+}
+
+static bool env_truthy(const char *name, bool default_value) {
+    const char *v = getenv(name);
+    if (!v || *v == '\0') return default_value;
+    return strcmp(v, "1") == 0 ||
+           strcmp(v, "true") == 0 ||
+           strcmp(v, "TRUE") == 0 ||
+           strcmp(v, "yes") == 0 ||
+           strcmp(v, "YES") == 0;
+}
+
+static int env_int(const char *name, int default_value) {
+    const char *v = getenv(name);
+    if (!v || *v == '\0') return default_value;
+    char *endptr = nullptr;
+    long parsed = strtol(v, &endptr, 0);
+    if (endptr == v || *endptr != '\0') return default_value;
+    return (int)parsed;
+}
+
+static std::string env_string(const char *name, const std::string &default_value) {
+    const char *v = getenv(name);
+    if (!v || *v == '\0') return default_value;
+    return std::string(v);
+}
+
+static SKXHammerBackend parse_backend() {
+    std::string s = env_string("BLACKSMITH_SKX_BACKEND", "simple");
+    if (s == "jit" || s == "JIT") return SKXHammerBackend::JIT;
+    return SKXHammerBackend::SIMPLE;
+}
+
+static FLUSHING_STRATEGY parse_flush_strategy() {
+    std::string s = env_string("BLACKSMITH_SKX_JIT_FLUSH", "early");
+    if (s == "late" || s == "LATEST" || s == "latest") {
+        return FLUSHING_STRATEGY::LATEST_POSSIBLE;
+    }
+    return FLUSHING_STRATEGY::EARLIEST_POSSIBLE;
+}
+
+static FENCING_STRATEGY parse_fence_strategy() {
+    std::string s = env_string("BLACKSMITH_SKX_JIT_FENCE", "late");
+    if (s == "none" || s == "omit" || s == "OMIT") {
+        return FENCING_STRATEGY::OMIT_FENCING;
+    }
+    if (s == "early" || s == "EARLIEST") {
+        return FENCING_STRATEGY::EARLIEST_POSSIBLE;
+    }
+    return FENCING_STRATEGY::LATEST_POSSIBLE;
+}
+
+static const char *backend_name(SKXHammerBackend backend) {
+    return backend == SKXHammerBackend::JIT ? "jit" : "simple";
 }
 
 SkxHammerer::SkxHammerer() {
@@ -150,10 +208,6 @@ std::vector<SKXPairCandidate> SkxHammerer::build_candidate_pairs(const std::vect
         return out;
     }
 
-    /*
-     * Assumes caller already filtered to a single bank and a single dominant context.
-     * We now want row-distinct pairs, with preference for small row distance.
-     */
     for (size_t i = 0; i < hits.size(); i++) {
         for (size_t j = i + 1; j < hits.size(); j++) {
             if (hits[i].row == hits[j].row) continue;
@@ -163,7 +217,6 @@ std::vector<SKXPairCandidate> SkxHammerer::build_candidate_pairs(const std::vect
             cand.b = hits[j];
             cand.row_distance = (long)hits[j].row - (long)hits[i].row;
             if (cand.row_distance < 0) cand.row_distance = -cand.row_distance;
-
             out.push_back(cand);
         }
     }
@@ -175,10 +228,6 @@ std::vector<SKXPairCandidate> SkxHammerer::build_candidate_pairs(const std::vect
         return x.a.va < y.a.va;
     });
 
-    /*
-     * Keep only one pair per row-row combination to avoid too many duplicates
-     * across different columns of the same two rows.
-     */
     std::vector<SKXPairCandidate> deduped;
     deduped.reserve(out.size());
 
@@ -221,8 +270,8 @@ void SkxHammerer::print_candidate_pairs(const std::vector<SKXPairCandidate> &pai
     fprintf(stderr, "\n");
 }
 
-void SkxHammerer::hammer_pair(volatile char *a, volatile char *b, size_t iters) {
-    SKXHAMDBG("hammer_pair: start a=%p b=%p iters=%zu", (void *)a, (void *)b, iters);
+void SkxHammerer::hammer_pair_simple(volatile char *a, volatile char *b, size_t iters) {
+    SKXHAMDBG("hammer_pair_simple: start a=%p b=%p iters=%zu", (void *)a, (void *)b, iters);
 
     volatile unsigned char sink = 0;
 
@@ -235,7 +284,7 @@ void SkxHammerer::hammer_pair(volatile char *a, volatile char *b, size_t iters) 
 
         if ((i % 1000000) == 0) {
             fprintf(stderr,
-                    "[SkxHammerer] hammer_pair progress: i=%zu / %zu\n",
+                    "[SkxHammerer] hammer_pair_simple progress: i=%zu / %zu\n",
                     i, iters);
         }
     }
@@ -244,7 +293,78 @@ void SkxHammerer::hammer_pair(volatile char *a, volatile char *b, size_t iters) 
         fprintf(stderr, "[SkxHammerer] sink guard triggered\n");
     }
 
-    SKXHAMDBG("hammer_pair: done");
+    SKXHAMDBG("hammer_pair_simple: done");
+}
+
+void SkxHammerer::hammer_pair_jit(volatile char *a, volatile char *b, size_t total_activations) {
+    const int acts_per_trefi = env_int("BLACKSMITH_SKX_JIT_ACTS_PER_TREFI", 64);
+    int sync_aggs = env_int("BLACKSMITH_SKX_JIT_SYNC_AGGS", 1);
+    if (sync_aggs < 1) sync_aggs = 1;
+    if (sync_aggs > 2) sync_aggs = 2;
+
+    const bool sync_each_ref = env_truthy("BLACKSMITH_SKX_JIT_SYNC_EACH_REF", true);
+    const FLUSHING_STRATEGY flushing = parse_flush_strategy();
+    const FENCING_STRATEGY fencing = parse_fence_strategy();
+
+    /*
+     * CodeJitter expects:
+     *   [sync-start aggressors] [hammer body aggressors] [sync-end aggressors]
+     * so we build an explicit sequence from our concrete SKX-selected pair.
+     */
+    std::vector<volatile char *> aggressors;
+
+    if (sync_aggs == 1) {
+        aggressors.push_back(a);  // sync-start
+    } else {
+        aggressors.push_back(a);
+        aggressors.push_back(b);
+    }
+
+    /*
+     * Middle hammer body. Repeating A,B many times gives CodeJitter
+     * enough body instructions to schedule and synchronize around.
+     */
+    for (int i = 0; i < 32; i++) {
+        aggressors.push_back(a);
+        aggressors.push_back(b);
+    }
+
+    if (sync_aggs == 1) {
+        aggressors.push_back(b);  // sync-end
+    } else {
+        aggressors.push_back(a);
+        aggressors.push_back(b);
+    }
+
+    fprintf(stderr,
+            "[SkxHammerer] hammer_pair_jit: start a=%p b=%p total_activations=%zu "
+            "acts_per_trefi=%d sync_each_ref=%d sync_aggs=%d flush=%s fence=%s seq_len=%zu\n",
+            (void *)a,
+            (void *)b,
+            total_activations,
+            acts_per_trefi,
+            sync_each_ref ? 1 : 0,
+            sync_aggs,
+            (flushing == FLUSHING_STRATEGY::EARLIEST_POSSIBLE ? "early" : "late"),
+            (fencing == FENCING_STRATEGY::OMIT_FENCING ? "none" :
+             fencing == FENCING_STRATEGY::EARLIEST_POSSIBLE ? "early" : "late"),
+            aggressors.size());
+
+    CodeJitter jitter;
+    jitter.jit_strict(acts_per_trefi,
+                      flushing,
+                      fencing,
+                      aggressors,
+                      sync_each_ref,
+                      sync_aggs,
+                      (int)total_activations);
+
+    FuzzingParameterSet dummy;
+    const int rc = jitter.hammer_pattern(dummy, false);
+    fprintf(stderr, "[SkxHammerer] hammer_pair_jit: hammer_pattern rc=%d\n", rc);
+
+    jitter.cleanup();
+    SKXHAMDBG("hammer_pair_jit: done");
 }
 
 size_t SkxHammerer::scan_flips(volatile char *buf,
@@ -279,17 +399,18 @@ bool SkxHammerer::write_csv_report(const std::string &path,
     }
 
     fprintf(fp,
-            "pair_index,hammer_iters,flip_count,row_distance,"
+            "pair_index,backend,hammer_iters,flip_count,row_distance,"
             "socket,imc,channel,dimm,rank,bank_group,bank,bank_id,"
             "row_a,col_a,va_a,pa_a,row_b,col_b,va_b,pa_b\n");
 
     for (size_t i = 0; i < results.size(); i++) {
         const auto &r = results[i];
         fprintf(fp,
-                "%zu,%zu,%zu,%ld,"
+                "%zu,%s,%zu,%zu,%ld,"
                 "%d,%d,%d,%d,%d,%d,%d,%d,"
                 "%llu,%llu,%p,0x%llx,%llu,%llu,%p,0x%llx\n",
                 i,
+                r.backend.c_str(),
                 r.hammer_iters,
                 r.flip_count,
                 r.pair.row_distance,
@@ -324,8 +445,10 @@ bool SkxHammerer::run(size_t bytes,
                       size_t max_hits,
                       int target_bank,
                       size_t hammer_iters) {
-    SKXHAMDBG("run: bytes=%zu step=%zu max_hits=%zu target_bank=%d hammer_iters=%zu",
-              bytes, step, max_hits, target_bank, hammer_iters);
+    const SKXHammerBackend backend = parse_backend();
+
+    SKXHAMDBG("run: bytes=%zu step=%zu max_hits=%zu target_bank=%d hammer_iters=%zu backend=%s",
+              bytes, step, max_hits, target_bank, hammer_iters, backend_name(backend));
 
     if (!decoder_.init()) {
         SKXHAMDBG("run: decoder init failed");
@@ -410,18 +533,16 @@ bool SkxHammerer::run(size_t bytes,
         const auto &pair = pairs[idx];
 
         fprintf(stderr,
-                "\n[SkxHammerer] === TESTING PAIR %zu/%zu ===\n"
+                "\n[SkxHammerer] === TESTING PAIR %zu/%zu (%s) ===\n"
                 "  rowA=0x%llx rowB=0x%llx distance=%ld bank_id=%d\n",
                 idx + 1,
                 pairs.size(),
+                backend_name(backend),
                 (unsigned long long)pair.a.row,
                 (unsigned long long)pair.b.row,
                 pair.row_distance,
                 pair.a.bank_id);
 
-        /*
-         * Reset memory before each trial.
-         */
         fill_pattern(buf, bytes, 0xFF);
         flush_buffer(buf, bytes);
 
@@ -449,7 +570,11 @@ bool SkxHammerer::run(size_t bytes,
                 (void *)pair.b.va,
                 (unsigned long long)pair.b.pa);
 
-        hammer_pair(pair.a.va, pair.b.va, hammer_iters);
+        if (backend == SKXHammerBackend::JIT) {
+            hammer_pair_jit(pair.a.va, pair.b.va, hammer_iters);
+        } else {
+            hammer_pair_simple(pair.a.va, pair.b.va, hammer_iters);
+        }
 
         flush_buffer(buf, bytes);
         fprintf(stderr, "[SkxHammerer] post-hammer flush complete for pair %zu\n", idx);
@@ -465,6 +590,7 @@ bool SkxHammerer::run(size_t bytes,
 
         SKXPairResult r{};
         r.pair = pair;
+        r.backend = backend_name(backend);
         r.hammer_iters = hammer_iters;
         r.flip_count = flip_count;
         results.push_back(r);
@@ -480,6 +606,7 @@ bool SkxHammerer::run(size_t bytes,
     write_csv_report("skx_pair_report.csv", results);
 
     fprintf(stderr, "\n[SkxHammerer] ===== FINAL SUMMARY =====\n");
+    fprintf(stderr, "[SkxHammerer] backend used: %s\n", backend_name(backend));
     fprintf(stderr, "[SkxHammerer] tested %zu candidate pairs\n", results.size());
     fprintf(stderr, "[SkxHammerer] chosen bank for testing: %d\n", chosen_bank);
 
