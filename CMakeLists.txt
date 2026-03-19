@@ -1,8 +1,6 @@
 cmake_minimum_required(VERSION 3.11 FATAL_ERROR)
 project(blacksmith VERSION 0.0.1 LANGUAGES CXX)
 
-# === OPTIONS ==================================================================
-
 set(
         BLACKSMITH_ENABLE_JSON
         ON
@@ -21,8 +19,6 @@ set(
 
 string(ASCII 27 ESC)
 
-# === DEFINITIONS ==============================================================
-
 set(GIT_COMMIT_HASH "NO_REPOSITORY")
 
 execute_process(
@@ -34,7 +30,6 @@ execute_process(
 )
 
 if (ret EQUAL "0")
-    # We're in a git repository, attempt to retrieve the current commit tag.
     execute_process(
             COMMAND git rev-parse HEAD
             WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
@@ -43,19 +38,18 @@ if (ret EQUAL "0")
     )
 endif ()
 
-# === DEPENDENCIES =============================================================
-
 add_subdirectory(external)
-
-# === LIBBLACKSMITH ============================================================
 
 add_library(
         bs
         include/GlobalDefines.hpp
         include/Utilities/TimeHelper.hpp
+        include/Memory/SKXDecoder.hpp
+        include/Forges/SkxHammerer.hpp
         src/Forges/FuzzyHammerer.cpp
         src/Forges/ReplayingHammerer.cpp
         src/Forges/TraditionalHammerer.cpp
+        src/Forges/SkxHammerer.cpp
         src/Fuzzer/Aggressor.cpp
         src/Fuzzer/AggressorAccessPattern.cpp
         src/Fuzzer/BitFlip.cpp
@@ -67,6 +61,7 @@ add_library(
         src/Memory/DRAMAddr.cpp
         src/Memory/DramAnalyzer.cpp
         src/Memory/Memory.cpp
+        src/Memory/SKXDecoder.cpp
         src/Utilities/Enums.cpp
         src/Utilities/Logger.cpp
 )
@@ -77,8 +72,6 @@ target_include_directories(
         ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-# Note: PUBLIC to also force consumers (i.e., the blacksmith executable) to use
-# these features and options.
 target_compile_features(
         bs
         PUBLIC
@@ -110,8 +103,6 @@ if (BLACKSMITH_ENABLE_JSON)
 endif ()
 
 if (BLACKSMITH_ENABLE_JITTING)
-    # This fixes an issue that causes GCC 10.3 (but not 8.3 or 11.1) to miss a
-    # header somehow.
     FetchContent_MakeAvailable(asmjit)
 
     target_include_directories(
@@ -133,8 +124,6 @@ if (BLACKSMITH_ENABLE_JITTING)
     )
 endif ()
 
-# === BLACKSMITH ===============================================================
-
 add_executable(
         blacksmith
         include/Blacksmith.hpp
@@ -153,8 +142,6 @@ target_link_libraries(
         bs
         argagg
 )
-
-# === CLEANUP ==================================================================
 
 unset(BLACKSMITH_ENABLE_JSON CACHE)
 unset(BLACKSMITH_ENABLE_JITTING CACHE)
