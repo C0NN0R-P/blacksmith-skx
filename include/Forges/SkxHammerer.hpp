@@ -15,6 +15,7 @@ struct SKXPairCandidate {
     SKXHit a;
     SKXHit b;
     long row_distance;
+    bool exact_double_sided;
 };
 
 struct SKXPairResult {

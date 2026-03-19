@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "Fuzzer/CodeJitter.hpp"
+#include "Fuzzer/FuzzingParameterSet.hpp"
 #include "Utilities/Enums.hpp"
 
 #define SKXHAMDBG(fmt, ...) fprintf(stderr, "[SkxHammerer] " fmt "\n", ##__VA_ARGS__)
@@ -202,12 +203,17 @@ int SkxHammerer::choose_best_bank(const std::vector<SKXHit> &hits, int requested
 
 std::vector<SKXPairCandidate> SkxHammerer::build_candidate_pairs(const std::vector<SKXHit> &hits,
                                                                  size_t max_pairs) {
-    std::vector<SKXPairCandidate> out;
+    std::vector<SKXPairCandidate> raw;
     if (hits.size() < 2) {
         SKXHAMDBG("build_candidate_pairs: not enough hits");
-        return out;
+        return raw;
     }
 
+    /*
+     * Caller has already filtered to one bank and one dominant context.
+     * We now want pairs from different rows.
+     * Strong preference: row distance == 2 (double-sided style).
+     */
     for (size_t i = 0; i < hits.size(); i++) {
         for (size_t j = i + 1; j < hits.size(); j++) {
             if (hits[i].row == hits[j].row) continue;
@@ -217,22 +223,33 @@ std::vector<SKXPairCandidate> SkxHammerer::build_candidate_pairs(const std::vect
             cand.b = hits[j];
             cand.row_distance = (long)hits[j].row - (long)hits[i].row;
             if (cand.row_distance < 0) cand.row_distance = -cand.row_distance;
-            out.push_back(cand);
+            cand.exact_double_sided = (cand.row_distance == 2);
+
+            raw.push_back(cand);
         }
     }
 
-    std::sort(out.begin(), out.end(), [](const SKXPairCandidate &x, const SKXPairCandidate &y) {
-        if (x.row_distance != y.row_distance) return x.row_distance < y.row_distance;
+    std::sort(raw.begin(), raw.end(), [](const SKXPairCandidate &x, const SKXPairCandidate &y) {
+        if (x.exact_double_sided != y.exact_double_sided) {
+            return x.exact_double_sided > y.exact_double_sided;
+        }
+        if (x.row_distance != y.row_distance) {
+            return x.row_distance < y.row_distance;
+        }
         if (x.a.row != y.a.row) return x.a.row < y.a.row;
         if (x.b.row != y.b.row) return x.b.row < y.b.row;
         return x.a.va < y.a.va;
     });
 
+    /*
+     * Deduplicate by row-row pair so we do not test many column variants
+     * of the same two rows.
+     */
     std::vector<SKXPairCandidate> deduped;
-    deduped.reserve(out.size());
+    deduped.reserve(raw.size());
 
     std::unordered_map<uint64_t, bool> seen;
-    for (const auto &cand : out) {
+    for (const auto &cand : raw) {
         uint64_t r1 = cand.a.row;
         uint64_t r2 = cand.b.row;
         if (r1 > r2) std::swap(r1, r2);
@@ -242,11 +259,35 @@ std::vector<SKXPairCandidate> SkxHammerer::build_candidate_pairs(const std::vect
         seen[key] = true;
 
         deduped.push_back(cand);
-        if (deduped.size() >= max_pairs) break;
     }
 
-    SKXHAMDBG("build_candidate_pairs: raw=%zu deduped=%zu",
-              out.size(), deduped.size());
+    /*
+     * Prefer exact distance-2 pairs. If none exist, fall back to nearest pairs.
+     */
+    std::vector<SKXPairCandidate> preferred;
+    preferred.reserve(deduped.size());
+
+    for (const auto &cand : deduped) {
+        if (cand.exact_double_sided) {
+            preferred.push_back(cand);
+        }
+    }
+
+    if (!preferred.empty()) {
+        if (preferred.size() > max_pairs) {
+            preferred.resize(max_pairs);
+        }
+        SKXHAMDBG("build_candidate_pairs: found %zu exact distance-2 pairs, using those",
+                  preferred.size());
+        return preferred;
+    }
+
+    if (deduped.size() > max_pairs) {
+        deduped.resize(max_pairs);
+    }
+
+    SKXHAMDBG("build_candidate_pairs: no exact distance-2 pairs, falling back to nearest %zu pairs",
+              deduped.size());
     return deduped;
 }
 
@@ -257,12 +298,13 @@ void SkxHammerer::print_candidate_pairs(const std::vector<SKXPairCandidate> &pai
     for (size_t i = 0; i < n; i++) {
         const auto &p = pairs[i];
         fprintf(stderr,
-                "  #%zu rowA=0x%llx rowB=0x%llx distance=%ld bank_id=%d "
+                "  #%zu rowA=0x%llx rowB=0x%llx distance=%ld exact_ds=%s bank_id=%d "
                 "A_va=%p B_va=%p\n",
                 i,
                 (unsigned long long)p.a.row,
                 (unsigned long long)p.b.row,
                 p.row_distance,
+                p.exact_double_sided ? "yes" : "no",
                 p.a.bank_id,
                 (void *)p.a.va,
                 (void *)p.b.va);
@@ -306,31 +348,25 @@ void SkxHammerer::hammer_pair_jit(volatile char *a, volatile char *b, size_t tot
     const FLUSHING_STRATEGY flushing = parse_flush_strategy();
     const FENCING_STRATEGY fencing = parse_fence_strategy();
 
-    /*
-     * CodeJitter expects:
-     *   [sync-start aggressors] [hammer body aggressors] [sync-end aggressors]
-     * so we build an explicit sequence from our concrete SKX-selected pair.
-     */
     std::vector<volatile char *> aggressors;
 
     if (sync_aggs == 1) {
-        aggressors.push_back(a);  // sync-start
+        aggressors.push_back(a);
     } else {
         aggressors.push_back(a);
         aggressors.push_back(b);
     }
 
     /*
-     * Middle hammer body. Repeating A,B many times gives CodeJitter
-     * enough body instructions to schedule and synchronize around.
+     * Shorter body for easier debugging.
      */
-    for (int i = 0; i < 32; i++) {
+    for (int i = 0; i < 8; i++) {
         aggressors.push_back(a);
         aggressors.push_back(b);
     }
 
     if (sync_aggs == 1) {
-        aggressors.push_back(b);  // sync-end
+        aggressors.push_back(b);
     } else {
         aggressors.push_back(a);
         aggressors.push_back(b);
@@ -351,6 +387,8 @@ void SkxHammerer::hammer_pair_jit(volatile char *a, volatile char *b, size_t tot
             aggressors.size());
 
     CodeJitter jitter;
+
+    fprintf(stderr, "[SkxHammerer] hammer_pair_jit: entering jit_strict\n");
     jitter.jit_strict(acts_per_trefi,
                       flushing,
                       fencing,
@@ -358,12 +396,17 @@ void SkxHammerer::hammer_pair_jit(volatile char *a, volatile char *b, size_t tot
                       sync_each_ref,
                       sync_aggs,
                       (int)total_activations);
+    fprintf(stderr, "[SkxHammerer] hammer_pair_jit: jit_strict complete\n");
 
     FuzzingParameterSet dummy;
+    fprintf(stderr, "[SkxHammerer] hammer_pair_jit: entering hammer_pattern\n");
     const int rc = jitter.hammer_pattern(dummy, false);
-    fprintf(stderr, "[SkxHammerer] hammer_pair_jit: hammer_pattern rc=%d\n", rc);
+    fprintf(stderr, "[SkxHammerer] hammer_pair_jit: hammer_pattern complete rc=%d\n", rc);
 
+    fprintf(stderr, "[SkxHammerer] hammer_pair_jit: entering cleanup\n");
     jitter.cleanup();
+    fprintf(stderr, "[SkxHammerer] hammer_pair_jit: cleanup complete\n");
+
     SKXHAMDBG("hammer_pair_jit: done");
 }
 
@@ -399,14 +442,14 @@ bool SkxHammerer::write_csv_report(const std::string &path,
     }
 
     fprintf(fp,
-            "pair_index,backend,hammer_iters,flip_count,row_distance,"
+            "pair_index,backend,hammer_iters,flip_count,row_distance,exact_double_sided,"
             "socket,imc,channel,dimm,rank,bank_group,bank,bank_id,"
             "row_a,col_a,va_a,pa_a,row_b,col_b,va_b,pa_b\n");
 
     for (size_t i = 0; i < results.size(); i++) {
         const auto &r = results[i];
         fprintf(fp,
-                "%zu,%s,%zu,%zu,%ld,"
+                "%zu,%s,%zu,%zu,%ld,%s,"
                 "%d,%d,%d,%d,%d,%d,%d,%d,"
                 "%llu,%llu,%p,0x%llx,%llu,%llu,%p,0x%llx\n",
                 i,
@@ -414,6 +457,7 @@ bool SkxHammerer::write_csv_report(const std::string &path,
                 r.hammer_iters,
                 r.flip_count,
                 r.pair.row_distance,
+                r.pair.exact_double_sided ? "yes" : "no",
 
                 r.pair.a.socket,
                 r.pair.a.imc,
@@ -511,7 +555,7 @@ bool SkxHammerer::run(size_t bytes,
 
     SKXHAMDBG("sorted %zu context hits by row/col", context_hits.size());
 
-    const size_t max_pairs = 16;
+    const size_t max_pairs = (backend == SKXHammerBackend::JIT) ? 2 : 16;
     auto pairs = build_candidate_pairs(context_hits, max_pairs);
 
     if (pairs.empty()) {
@@ -534,13 +578,14 @@ bool SkxHammerer::run(size_t bytes,
 
         fprintf(stderr,
                 "\n[SkxHammerer] === TESTING PAIR %zu/%zu (%s) ===\n"
-                "  rowA=0x%llx rowB=0x%llx distance=%ld bank_id=%d\n",
+                "  rowA=0x%llx rowB=0x%llx distance=%ld exact_ds=%s bank_id=%d\n",
                 idx + 1,
                 pairs.size(),
                 backend_name(backend),
                 (unsigned long long)pair.a.row,
                 (unsigned long long)pair.b.row,
                 pair.row_distance,
+                pair.exact_double_sided ? "yes" : "no",
                 pair.a.bank_id);
 
         fill_pattern(buf, bytes, 0xFF);
@@ -611,20 +656,24 @@ bool SkxHammerer::run(size_t bytes,
     fprintf(stderr, "[SkxHammerer] chosen bank for testing: %d\n", chosen_bank);
 
     size_t num_pairs_with_flips = 0;
+    size_t num_exact_ds_pairs = 0;
     for (const auto &r : results) {
         if (r.flip_count > 0) num_pairs_with_flips++;
+        if (r.pair.exact_double_sided) num_exact_ds_pairs++;
     }
 
+    fprintf(stderr, "[SkxHammerer] exact distance-2 pairs tested: %zu\n", num_exact_ds_pairs);
     fprintf(stderr, "[SkxHammerer] pairs with flips: %zu\n", num_pairs_with_flips);
 
     if (best_index >= 0) {
         const auto &best = results[(size_t)best_index];
         fprintf(stderr,
                 "[SkxHammerer] best pair index=%zd flip_count=%zu row_distance=%ld "
-                "rowA=0x%llx rowB=0x%llx\n",
+                "exact_ds=%s rowA=0x%llx rowB=0x%llx\n",
                 best_index,
                 best.flip_count,
                 best.pair.row_distance,
+                best.pair.exact_double_sided ? "yes" : "no",
                 (unsigned long long)best.pair.a.row,
                 (unsigned long long)best.pair.b.row);
     }
